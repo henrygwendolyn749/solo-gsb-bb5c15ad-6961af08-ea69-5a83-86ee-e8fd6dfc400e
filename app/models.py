@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .irt import THETA_MAX, THETA_MIN
 
@@ -82,6 +82,37 @@ class SessionCreate(BaseModel):
             "值为正整数，所有配额之和不超过 max_items；不传则不设配额"
         ),
     )
+    target_se: float | None = Field(
+        None,
+        gt=0.0,
+        allow_inf_nan=False,
+        description=(
+            "可选能力估计精度停测目标标准误（正有限值，SE = 1/√Σ Fisher 信息）；"
+            "须与 min_precision_items 同时提供，不传则不按精度停测"
+        ),
+    )
+    min_precision_items: PositiveIntField | None = Field(
+        None,
+        ge=1,
+        le=50,
+        description=(
+            "触发精度停测前至少需要作答的题数（1～max_items）；"
+            "须与 target_se 同时提供"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_precision_stop(self) -> SessionCreate:
+        if (self.target_se is None) != (self.min_precision_items is None):
+            raise ValueError(
+                "target_se 与 min_precision_items 必须同时提供或同时省略"
+            )
+        if (
+            self.min_precision_items is not None
+            and self.min_precision_items > self.max_items
+        ):
+            raise ValueError("min_precision_items 不能大于 max_items")
+        return self
 
 
 class SessionOut(BaseModel):
@@ -93,6 +124,15 @@ class SessionOut(BaseModel):
     duration_seconds: int | None = None
     expires_at: str | None = None
     tag_minimums: dict[str, int] = Field(default_factory=dict)
+    target_se: float | None = Field(
+        None, description="精度停测目标标准误；未启用时为 null"
+    )
+    min_precision_items: int | None = Field(
+        None, description="精度停测最少作答题数；未启用时为 null"
+    )
+    standard_error: float | None = Field(
+        None, description="当前 θ 下全部已答题的估计标准误 1/√Σ信息；无已答题为 null"
+    )
     status: str
     finish_reason: str | None
     answered_count: int
@@ -109,6 +149,9 @@ class NextItemOut(BaseModel):
     exposure_limit: int
     answered_count: int
     max_items: int
+    target_se: float | None = None
+    min_precision_items: int | None = None
+    standard_error: float | None = None
     finish_reason: str | None = None
     note: str | None = None
 
@@ -169,6 +212,15 @@ class ProgressOut(BaseModel):
     )
     tag_answered: dict[str, int] = Field(
         default_factory=dict, description="各内容标签已答题数（按答题记录统计）"
+    )
+    target_se: float | None = Field(
+        None, description="精度停测目标标准误；未启用时为 null"
+    )
+    min_precision_items: int | None = Field(
+        None, description="精度停测最少作答题数；未启用时为 null"
+    )
+    standard_error: float | None = Field(
+        None, description="当前 θ 下的能力估计标准误；无已答题或总信息为零时为 null"
     )
     finish_reason: str | None
     current_item: ItemOut | None

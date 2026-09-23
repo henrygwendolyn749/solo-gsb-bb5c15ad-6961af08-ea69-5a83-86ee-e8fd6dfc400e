@@ -5,7 +5,9 @@ Flow
 1. ``POST /api/sessions``            create an examinee session
 2. ``POST /api/sessions/{id}/next``  get the most informative eligible item
 3. ``POST /api/sessions/{id}/responses``  submit an answer; theta is updated
-4. repeat 2-3 until the session finishes (max items or no eligible item)
+4. repeat 2-3 until the session finishes (max items, no eligible item,
+   expired deadline, or -- when configured -- the precision stop rule
+   ``finish_reason = 'precision_reached'``)
 
 Mutating endpoints use ``BEGIN IMMEDIATE`` so concurrent requests on the same
 SQLite database are serialised; exposure counts and ability updates therefore
@@ -15,6 +17,7 @@ cannot be lost to read/write races.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import uuid
@@ -23,8 +26,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from . import irt
 from .database import get_db, init_db
@@ -53,6 +57,39 @@ app = FastAPI(
     ),
     version="1.0.0",
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    _request: Request, exc: RequestValidationError
+) -> Response:
+    """422 handler whose body is always strict-JSON serialisable.
+
+    FastAPI echoes the offending input in each error, and a non-finite
+    float (``Infinity``/``NaN`` in a non-strict request body) makes the
+    default handler itself crash with 500 while rendering that echo.
+    Replace such values with a marker string instead.
+    """
+
+    def sanitize(value: object) -> object:
+        if isinstance(value, float) and not math.isfinite(value):
+            return "<non-finite>"
+        if isinstance(value, dict):
+            return {k: sanitize(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [sanitize(v) for v in value]
+        if isinstance(value, (str, int, bool)) or value is None:
+            return value
+        # Pydantic keeps the original exception object in a model-validator
+        # error's ctx; render anything else as its string form.
+        return str(value)
+
+    body = json.dumps(
+        {"detail": sanitize(exc.errors())}, ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+    return Response(
+        content=body, status_code=422, media_type="application/json"
+    )
 
 
 # -------------------------------------------------------------------------
@@ -180,6 +217,30 @@ def answered_count(conn: sqlite3.Connection, session_id: str) -> int:
     ).fetchone()[0]
 
 
+def session_standard_error(
+    conn: sqlite3.Connection, session_id: str, theta: float
+) -> float | None:
+    """SE of the ability estimate: ``1 / sqrt(sum I_j(theta))``.
+
+    Fisher information of *every* item already answered in this session is
+    re-evaluated at the current theta (2PL).  Returns ``None`` when no item
+    has been answered or the summed information is not positive; the
+    precision stop rule can never fire in that case.
+    """
+    rows = conn.execute(
+        """
+        SELECT i.discrimination AS a, i.difficulty AS b
+        FROM responses r JOIN items i ON i.id = r.item_id
+        WHERE r.session_id = ?
+        """,
+        (session_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    total_info = math.fsum(irt.information(theta, r["a"], r["b"]) for r in rows)
+    return irt.standard_error(total_info)
+
+
 def tag_minimums_for(conn: sqlite3.Connection, session_id: str) -> dict[str, int]:
     """Persisted content-tag quotas of a session (empty dict when none set)."""
     return {
@@ -222,7 +283,10 @@ def tag_shortfalls(
 
 
 def serialize_session(
-    row: sqlite3.Row, n_answered: int, tag_minimums: dict[str, int] | None = None
+    row: sqlite3.Row,
+    n_answered: int,
+    tag_minimums: dict[str, int] | None = None,
+    standard_error: float | None = None,
 ) -> SessionOut:
     return SessionOut(
         id=row["id"],
@@ -233,6 +297,9 @@ def serialize_session(
         duration_seconds=row["duration_seconds"],
         expires_at=row["expires_at"],
         tag_minimums=tag_minimums or {},
+        target_se=row["target_se"],
+        min_precision_items=row["min_precision_items"],
+        standard_error=standard_error,
         status=row["status"],
         finish_reason=row["finish_reason"],
         answered_count=n_answered,
@@ -370,9 +437,9 @@ def create_session(
             """
             INSERT INTO sessions
                 (id, theta, current_item_id, max_items, exposure_limit,
-                 duration_seconds, expires_at,
+                 duration_seconds, expires_at, target_se, min_precision_items,
                  status, finish_reason, created_at, updated_at)
-            VALUES (?, ?, NULL, ?, ?, ?, ?, 'active', NULL, ?, ?)
+            VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?)
             """,
             (
                 session_id,
@@ -381,6 +448,8 @@ def create_session(
                 body.exposure_limit or DEFAULT_EXPOSURE_LIMIT,
                 duration,
                 expires_at,
+                body.target_se,
+                body.min_precision_items,
                 now,
                 now,
             ),
@@ -400,8 +469,10 @@ def get_session(
     session_id: str, conn: sqlite3.Connection = Depends(get_db)
 ) -> SessionOut:
     row = get_session_or_404(conn, session_id)
+    n_answered = answered_count(conn, session_id)
+    se = session_standard_error(conn, session_id, row["theta"])
     return serialize_session(
-        row, answered_count(conn, session_id), tag_minimums_for(conn, session_id)
+        row, n_answered, tag_minimums_for(conn, session_id), se
     )
 
 
@@ -432,6 +503,7 @@ def session_progress(
     bank_size = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
     minimums = tag_minimums_for(conn, session_id)
     answered_tags = answered_by_tag(conn, session_id)
+    se = session_standard_error(conn, session_id, session["theta"])
     # Report zero answered for every quota tag even if it has no response yet.
     tag_answered = {tag: answered_tags.get(tag, 0) for tag in minimums}
     tag_answered.update(answered_tags)
@@ -448,6 +520,9 @@ def session_progress(
         expires_at=session["expires_at"],
         tag_minimums=minimums,
         tag_answered=dict(sorted(tag_answered.items())),
+        target_se=session["target_se"],
+        min_precision_items=session["min_precision_items"],
+        standard_error=se,
         finish_reason=session["finish_reason"],
         current_item=current_item,
         answered_item_ids=answered_ids,
@@ -515,6 +590,9 @@ def next_item(
     the request is rejected with 409; no exposure is added.
     """
     outcome: dict
+    target_se: float | None = None
+    min_precision_items: int | None = None
+    se: float | None = None
 
     with transaction(conn):
         session = conn.execute(
@@ -530,7 +608,12 @@ def next_item(
         if expired is not None:
             raise time_expired_409(expired)
 
+        target_se = session["target_se"]
+        min_precision_items = session["min_precision_items"]
         n_answered = answered_count(conn, session_id)
+        # /next never changes theta or the response set, so the current SE is
+        # the same for every branch below.
+        se = session_standard_error(conn, session_id, session["theta"])
         now = utc_now()
 
         # Case 1: a served, unanswered item is pending -> return it as-is.
@@ -549,6 +632,9 @@ def next_item(
                 "exposure_limit": session["exposure_limit"],
                 "answered_count": n_answered,
                 "max_items": session["max_items"],
+                "target_se": target_se,
+                "min_precision_items": min_precision_items,
+                "standard_error": se,
                 "finish_reason": session["finish_reason"],
                 "note": "pending_item: 该题尚未作答，重复请求不重复计曝光",
             }
@@ -562,6 +648,9 @@ def next_item(
                 "exposure_limit": session["exposure_limit"],
                 "answered_count": n_answered,
                 "max_items": session["max_items"],
+                "target_se": target_se,
+                "min_precision_items": min_precision_items,
+                "standard_error": se,
                 "finish_reason": session["finish_reason"],
                 "note": "测验已结束",
             }
@@ -582,6 +671,9 @@ def next_item(
                 "exposure_limit": session["exposure_limit"],
                 "answered_count": n_answered,
                 "max_items": session["max_items"],
+                "target_se": target_se,
+                "min_precision_items": min_precision_items,
+                "standard_error": se,
                 "finish_reason": "max_items",
                 "note": "已达到最大题量",
             }
@@ -650,6 +742,9 @@ def next_item(
                     "exposure_limit": session["exposure_limit"],
                     "answered_count": n_answered,
                     "max_items": session["max_items"],
+                    "target_se": target_se,
+                    "min_precision_items": min_precision_items,
+                    "standard_error": se,
                     "finish_reason": finish_reason,
                     "note": note,
                 }
@@ -685,6 +780,9 @@ def next_item(
                         "exposure_limit": session["exposure_limit"],
                         "answered_count": n_answered,
                         "max_items": session["max_items"],
+                        "target_se": target_se,
+                        "min_precision_items": min_precision_items,
+                        "standard_error": se,
                         "finish_reason": "tag_minimums_unfulfillable",
                         "note": (
                             "欠额标签的可用题数不足以补齐配额，"
@@ -728,6 +826,9 @@ def next_item(
                         "exposure_limit": session["exposure_limit"],
                         "answered_count": n_answered,
                         "max_items": session["max_items"],
+                        "target_se": target_se,
+                        "min_precision_items": min_precision_items,
+                        "standard_error": se,
                         "finish_reason": None,
                         "note": None,
                     }
@@ -742,6 +843,9 @@ def next_item(
         exposure_limit=outcome["exposure_limit"],
         answered_count=outcome["answered_count"],
         max_items=outcome["max_items"],
+        target_se=outcome["target_se"],
+        min_precision_items=outcome["min_precision_items"],
+        standard_error=outcome["standard_error"],
         finish_reason=outcome["finish_reason"],
         note=outcome["note"],
     )
@@ -773,6 +877,14 @@ def submit_response(
     same write lock, so even a burst of concurrent retries observes the
     first committed record and is replayed (HTTP 200) instead of being
     scored a second time.
+
+    After the theta update the optional precision stop is evaluated in the
+    same transaction: when the session has a ``target_se``, the summed 2PL
+    Fisher information of every answered item is recomputed at the new theta
+    and the session finishes with ``finish_reason = 'precision_reached'``
+    once the answered count reaches ``min_precision_items``, the standard
+    error is at most ``target_se`` and all tag quotas are met.  A replayed
+    request takes the idempotency branch above and never re-evaluates it.
     """
     response_key = body.response.strip().upper()
     stored_row: sqlite3.Row | None = None
@@ -881,7 +993,8 @@ def submit_response(
                 else:
                     raise HTTPException(status_code=409, detail="重复作答冲突")
             else:
-                # 5) Advance session state; finish eagerly at max_items.
+                # 5) Advance session state; finish eagerly at max_items, or
+                #    when the optional precision stop rule is satisfied.
                 conn.execute(
                     """UPDATE sessions
                        SET theta = ?, current_item_id = NULL, updated_at = ?
@@ -893,6 +1006,7 @@ def submit_response(
                     (session_id,),
                 ).fetchone()[0]
                 if total >= session["max_items"]:
+                    # A full answer sheet wins over every other stop rule.
                     conn.execute(
                         """UPDATE sessions
                            SET status = 'finished', finish_reason = 'max_items',
@@ -900,6 +1014,33 @@ def submit_response(
                            WHERE id = ?""",
                         (now, session_id),
                     )
+                elif session["target_se"] is not None:
+                    # Optional precision stop: re-evaluate the summed 2PL
+                    # Fisher information of *all* answered items at the new
+                    # theta.  The session ends in this same transaction only
+                    # when the answer count has reached the configured floor,
+                    # SE <= target_se and every tag quota is already met.  A
+                    # zero/non-positive total gives SE = NULL and can never
+                    # fire; otherwise the selection flow continues unchanged.
+                    se = session_standard_error(conn, session_id, theta_after)
+                    quota_met = not tag_shortfalls(
+                        tag_minimums_for(conn, session_id),
+                        answered_by_tag(conn, session_id),
+                    )
+                    if (
+                        se is not None
+                        and total >= session["min_precision_items"]
+                        and se <= session["target_se"]
+                        and quota_met
+                    ):
+                        conn.execute(
+                            """UPDATE sessions
+                               SET status = 'finished',
+                                   finish_reason = 'precision_reached',
+                                   updated_at = ?
+                               WHERE id = ?""",
+                            (now, session_id),
+                        )
                 stored_row = conn.execute(
                     "SELECT * FROM responses WHERE id = ?", (body.response_id,)
                 ).fetchone()

@@ -7,9 +7,11 @@ Run with the API already listening on http://127.0.0.1:8000:
 It creates a time-limited session, runs a mini adaptive quiz, demonstrates
 idempotent retry with a repeated response_id, shows /next de-duplication,
 prints session progress and the answer history, and demonstrates the
-duration_seconds validation (60..86400).  Finally it demonstrates content-tag
+duration_seconds validation (60..86400).  It then demonstrates content-tag
 minimum quotas (``tag_minimums``), including the
-``tag_minimums_unfulfillable`` finish reason when a quota cannot be met.
+``tag_minimums_unfulfillable`` finish reason when a quota cannot be met, and
+finally the optional precision stop rule (``target_se`` /
+``min_precision_items``, ``finish_reason = precision_reached``).
 """
 
 from __future__ import annotations
@@ -171,6 +173,112 @@ def main() -> None:
     show("GET /api/items?limit=3 (题库与曝光)", bank)
 
     demo_tag_minimums()
+    demo_precision_stop()
+
+
+def demo_precision_stop() -> None:
+    """Show target_se/min_precision_items and the precision_reached finish."""
+    # 校验：两个参数必须成对出现；target_se 须为正有限数；
+    # min_precision_items 不能大于 max_items -> 均返回 422。
+    expect_http_error(
+        "POST", "/api/sessions", {"target_se": 0.5},
+    )
+    expect_http_error(
+        "POST", "/api/sessions", {"min_precision_items": 2},
+    )
+    expect_http_error(
+        "POST", "/api/sessions",
+        {"target_se": 0, "min_precision_items": 2},
+    )
+    expect_http_error(
+        "POST", "/api/sessions",
+        {"max_items": 3, "target_se": 0.5, "min_precision_items": 4},
+    )
+
+    # 目标标准误 0.8、至少作答 3 题后才允许触发精度停测。
+    # exposure_limit 放大到 10000：避免与本场其他演示共享的全局曝光计数
+    # 影响选题，让本段每次运行的轨迹都一致。
+    session = call(
+        "POST", "/api/sessions",
+        {"max_items": 12, "exposure_limit": 10_000,
+         "target_se": 0.8, "min_precision_items": 3},
+    )
+    sid = session["id"]
+    assert session["target_se"] == 0.8
+    assert session["min_precision_items"] == 3
+    assert session["standard_error"] is None
+    print("  -> 创建精度停测会话：target_se=0.8，min_precision_items=3")
+
+    # 模拟一个真实能力固定在 theta=0 的考生：答对概率始终按 theta=0 计算，
+    # 这样 θ 估计会在 0 附近波动，标准误会随作答题数稳定下降。
+    rng = random.Random(123)
+    theta_true = 0.0
+    trace: list[dict] = []
+    for turn in range(1, 13):
+        chosen = call("POST", f"/api/sessions/{sid}/next")
+        assert chosen["target_se"] == 0.8
+        assert chosen["min_precision_items"] == 3
+        if chosen["item"] is None:
+            break
+        item = chosen["item"]
+        detail = call("GET", f"/api/items/{item['id']}")
+        keys = [opt["key"] for opt in item["options"]]
+        z = item["discrimination"] * (theta_true - item["difficulty"])
+        p = 1 / (1 + math.exp(-z))
+        answer = (
+            detail["answer"]
+            if rng.random() < p
+            else rng.choice([k for k in keys if k != detail["answer"]])
+        )
+        call(
+            "POST", f"/api/sessions/{sid}/responses",
+            {"response_id": f"demo-se-{turn}-sid-{sid[:8]}",
+             "item_id": item["id"], "response": answer},
+        )
+        progress = call("GET", f"/api/sessions/{sid}/progress")
+        trace.append({
+            "turn": turn,
+            "answered": progress["answered_count"],
+            "standard_error": (
+                round(progress["standard_error"], 4)
+                if progress["standard_error"] is not None else None
+            ),
+            "status": progress["status"],
+            "finish_reason": progress["finish_reason"],
+        })
+        if progress["status"] == "finished":
+            assert progress["finish_reason"] == "precision_reached"
+            assert progress["answered_count"] >= 3
+            assert progress["standard_error"] <= 0.8 + 1e-12
+            break
+    else:  # pragma: no cover - the target is deliberately easy to reach
+        raise AssertionError("精度停测应当被触发")
+
+    show("精度停测（SE 轨迹，到达 0.8 且已答 >=3 题即停）", {
+        "target_se": 0.8,
+        "min_precision_items": 3,
+        "trace": trace,
+    })
+    n_stopped = trace[-1]["answered"]
+    print(
+        f"  -> 第 {n_stopped} 题作答后 SE={trace[-1]['standard_error']} "
+        "<= 0.8，会话以 precision_reached 结束 ✔"
+    )
+
+    # 重复提交最后一次 response_id：回放首次结果，不重复触发状态变化。
+    history = call("GET", f"/api/sessions/{sid}/responses")
+    last = history["results"][-1]
+    replay = call(
+        "POST", f"/api/sessions/{sid}/responses",
+        {"response_id": last["id"], "item_id": last["item_id"],
+         "response": last["response"]},
+    )
+    assert replay["created_at"] == last["created_at"]
+    progress = call("GET", f"/api/sessions/{sid}/progress")
+    assert progress["status"] == "finished"
+    assert progress["finish_reason"] == "precision_reached"
+    assert progress["answered_count"] == n_stopped
+    print("  -> 重复 response_id 回放，状态与已答数不变 ✔")
 
 
 def demo_tag_minimums() -> None:

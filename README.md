@@ -8,7 +8,8 @@
 - `response_id` 为客户端幂等键：**重复提交返回首次结果，不重复更新能力值、不重复计曝光**；
 - 支持可选测验时限 `duration_seconds`（60～86400 秒）：创建时按 UTC 记录截止时间 `expires_at`，到期后取题/作答原子结束会话并返回 `409`；
 - 支持可选**内容标签最低配额** `tag_minimums`：按 `content_tag` 声明本场至少要答的题数；剩余答题位仅够补缺口时只从欠额标签选题，欠额标签题量不足时以明确的 `finish_reason` 结束且不额外计曝光；
-- 提供会话进度查询与完整答题记录查询；
+- 支持可选**能力估计精度停测** `target_se` + `min_precision_items`：每次作答更新 θ 后，在当前 θ 处重算本场全部已答题的 2PL Fisher 信息总和，`SE = 1/√Σ信息`；已答数达到下限、`SE ≤ target_se` 且标签配额均已满足时，在同一事务内结束会话（`finish_reason = precision_reached`）；
+- 提供会话进度查询与完整答题记录查询，会话状态/进度/取题响应均返回当前标准误 `standard_error` 与停测配置；
 - 自带 30 题确定性演示题库，容器启动后即可调用。
 
 ## 目录结构
@@ -60,7 +61,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 python examples/demo.py
 ```
 
-脚本会：创建带 600 秒时限的会话（演示 `duration_seconds` 越界校验与 `expires_at`）→ 循环「取题 → 作答」5 轮 → 演示重复 `response_id` 幂等、重复 `/next` 不重复计曝光 → 打印进度与答题记录 → 演示 `tag_minimums` 配额选题（含配额校验、末段只从欠额标签选题、无法补齐时 `tag_minimums_unfulfillable` 结束且不增加曝光）。
+脚本会：创建带 600 秒时限的会话（演示 `duration_seconds` 越界校验与 `expires_at`）→ 循环「取题 → 作答」5 轮 → 演示重复 `response_id` 幂等、重复 `/next` 不重复计曝光 → 打印进度与答题记录 → 演示 `tag_minimums` 配额选题（含配额校验、末段只从欠额标签选题、无法补齐时 `tag_minimums_unfulfillable` 结束且不增加曝光）→ 演示精度停测（参数校验、SE 逐题下降、`precision_reached` 触发与重复 `response_id` 不重复触发状态变化）。
 
 ## 核心算法
 
@@ -68,7 +69,8 @@ python examples/demo.py
 
 ```
 P(θ) = 1 / (1 + exp(-a(θ - b)))          # 答对概率
-I(θ) = a² · P(θ) · (1 - P(θ))            # Fisher 信息量
+I(θ) = a² · P(θ) · (1 - P(θ))            # 单题 Fisher 信息量
+SE(θ) = 1 / sqrt( Σ_j I_j(θ) )           # 本场已答题总信息量对应的估计标准误
 ```
 
 ### 作答后一次 Newton 更新
@@ -100,6 +102,7 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 - 没有满足曝光上限的候选题 → 结束，`finish_reason = no_available_items`；
 - 设置了标签配额且欠额标签已无法补齐 → 结束，
   `finish_reason = tag_minimums_unfulfillable`（见下节）。
+- `precision_reached` 不在 `/next` 内产生：精度停测只在作答提交、θ 更新之后判定（见下节）。
 
 ### 内容标签最低配额（可选 `tag_minimums`）
 
@@ -131,6 +134,30 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
   并以 **HTTP 409** 拒绝本次操作；**不会**增加任何曝光计数，也**不会**写入答题记录。
   未到期时完全保留原有行为（包括挂起题不重复计曝光、`response_id` 幂等）。
 - 只读的会话/进度/记录查询不触发自动结束；客户端可据 `expires_at` 自行倒计时。
+
+### 能力估计精度停测（可选 `target_se` + `min_precision_items`）
+
+- 创建会话时可同时传：
+  - `target_se`：目标能力估计标准误，须为**正有限**浮点数（`> 0`，不接受 `0`、负数、`Infinity`、`NaN`）；
+  - `min_precision_items`：触发停测前的**最少作答数**，正整数，取值 **1～`max_items`**。
+  - 两者必须**同时提供或同时省略**；校验失败返回 `422`。不传时不启用精度停测，流程与旧版完全一致。
+- 配置持久化在 `sessions` 表（`target_se` / `min_precision_items` 两列）；旧版本数据库在服务启动时
+  通过 `ALTER TABLE ... ADD COLUMN` 自动迁移（旧会话两列为 `NULL`，行为不变）。
+- 每次成功作答并完成 θ 更新后，在**同一写事务**内于**当前 θ** 处，对本场**全部已答题**重新计算
+  2PL Fisher 信息总和 `Σ I_j(θ)`，标准误为 `SE = 1/√Σ信息`。当：
+  1. 已答数 `>= min_precision_items`，且
+  2. `SE <= target_se`，且
+  3. 所有 `tag_minimums` 标签配额均已满足（未设置配额时自动满足），
+
+  即在该事务内把会话置为 `finished`、`finish_reason = precision_reached`、清空挂起题；
+  任一条件不满足则继续原有「信息量最大」选题流程。信息总和为零（非正）时 `standard_error` 返回
+  **`null`**，此时不可能触发停测。
+- 原有规则优先级不变：`time_expired`（到期最先检查）与 `max_items`（答满）优先于精度停测；
+  精度停测只发生在作答提交之后，`/next` 不会替它结束会话。
+- 会话状态 `GET /api/sessions/{id}`、进度 `/progress` 与取题响应 `/next` 均返回
+  `target_se`、`min_precision_items` 与当前 `standard_error`（无已答题时为 `null`）。
+- 重复提交同一 `response_id` 走幂等回放分支：以 `200` 返回首次结果，**不会**重算 θ、重算 SE，
+  也**不会**再次触发或改变 `precision_reached` 状态。
 
 ### 幂等作答（`POST /api/sessions/{id}/responses`）
 
@@ -191,6 +218,16 @@ curl -s -X POST http://localhost:8000/api/sessions \
 #  "tag_minimums":{"几何":3,"概率统计":2}, "status":"active", ...}
 # 配额之和超过 max_items、值非正整数或标签不存在 -> HTTP 422
 
+# 2d) 也可以启用能力估计精度停测：target_se 为正有限数，
+#     min_precision_items 为 1~max_items 的正整数，二者必须同时提供
+curl -s -X POST http://localhost:8000/api/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"initial_theta": 0.0, "max_items": 15,
+       "target_se": 0.8, "min_precision_items": 5}'
+# {"id":"...", "max_items":15, "target_se":0.8,
+#  "min_precision_items":5, "standard_error":null, "status":"active", ...}
+# 只给一个参数、target_se<=0/Infinity/NaN、min_precision_items>max_items -> HTTP 422
+
 # 3) 选下一题
 curl -s -X POST http://localhost:8000/api/sessions/$SID/next
 # item.id / item.stem / item.options / information / exposure_count ...
@@ -212,13 +249,17 @@ curl -s -X POST http://localhost:8000/api/sessions/$SID/responses \
 # 6) 查询会话（含 expires_at）、进度与答题记录
 curl -s http://localhost:8000/api/sessions/$SID
 curl -s http://localhost:8000/api/sessions/$SID/progress
-# progress 还返回 "tag_minimums"（配额）与 "tag_answered"（各标签已答数）
+# progress 还返回 "tag_minimums"（配额）、"tag_answered"（各标签已答数）
+# 以及 "target_se" / "min_precision_items"（停测配置）和
+# "standard_error"（当前 θ 处 1/√ΣFisher 信息；无已答题为 null）
 curl -s http://localhost:8000/api/sessions/$SID/responses
 ```
 
 重复步骤 3-4 即可完成整场测验；当 `status` 变为 `finished` 时，可从
 `finish_reason` 得知结束原因（`max_items` / `no_available_items` /
-`time_expired` / `tag_minimums_unfulfillable`）。
+`time_expired` / `tag_minimums_unfulfillable` / `precision_reached`）。
+其中 `precision_reached` 仅在启用了精度停测的会话上出现，且只由一次**新的**
+成功作答在同一事务内触发；答满 `max_items` 与到期停测的优先级高于精度停测。
 
 ## 环境变量
 

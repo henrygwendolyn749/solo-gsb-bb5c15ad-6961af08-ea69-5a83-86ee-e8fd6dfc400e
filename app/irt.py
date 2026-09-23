@@ -20,6 +20,14 @@ single binary response ``u`` (1 = correct, 0 = wrong).  For one observation::
 so the Newton update is::
 
     theta' = theta - d1/d2 = theta + a * (u - P) / I(theta)
+
+Over a session the standard error of the ability estimate is approximated
+from the summed Fisher information of every answered item at the current
+theta::
+
+    SE(theta) = 1 / sqrt(sum_j I_j(theta))
+
+When that sum is zero the standard error is undefined (``None``).
 """
 
 from __future__ import annotations
@@ -52,6 +60,17 @@ def information(theta: float, a: float, b: float) -> float:
     """Fisher information of item (a, b) at ability theta."""
     p = probability(theta, a, b)
     return (a * a) * p * (1.0 - p)
+
+
+def standard_error(total_info: float) -> float | None:
+    """Ability estimate standard error ``1 / sqrt(sum I)``.
+
+    Returns ``None`` when the accumulated information is zero (or not
+    positive), in which case the precision stop rule cannot fire.
+    """
+    if total_info <= 0.0:
+        return None
+    return 1.0 / math.sqrt(total_info)
 
 
 def newton_step(
