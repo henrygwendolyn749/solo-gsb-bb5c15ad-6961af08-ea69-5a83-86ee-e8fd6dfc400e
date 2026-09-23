@@ -33,10 +33,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     exposure_limit   INTEGER NOT NULL,
     duration_seconds INTEGER, -- optional time limit in seconds (60..86400); NULL = no limit
     expires_at       TEXT,    -- UTC ISO-8601 deadline (created_at + duration_seconds)
+    target_se        REAL,    -- optional precision-stop target SE; NULL = disabled
+    min_precision_items INTEGER, -- minimum answers before precision stop (1..max_items)
     status           TEXT NOT NULL DEFAULT 'active'
                      CHECK (status IN ('active', 'finished')),
     finish_reason    TEXT, -- 'max_items' | 'no_available_items'
                      -- 'time_expired' | 'tag_minimums_unfulfillable'
+                     -- 'precision_reached'
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
 );
@@ -108,6 +111,10 @@ def init_db() -> None:
         # Migrate databases created before the optional session time limit.
         _ensure_column(conn, "sessions", "duration_seconds", "INTEGER")
         _ensure_column(conn, "sessions", "expires_at", "TEXT")
+        # Migrate databases created before the optional precision stopping:
+        # existing sessions keep NULLs, i.e. precision stopping stays off.
+        _ensure_column(conn, "sessions", "target_se", "REAL")
+        _ensure_column(conn, "sessions", "min_precision_items", "INTEGER")
         count = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
         if count == 0:
             conn.executemany(

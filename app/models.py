@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import math
 from typing import Annotated
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .irt import THETA_MAX, THETA_MIN
 
 # JSON booleans must not sneak in as quota values; strict ints reject them.
 PositiveIntField = Annotated[int, Field(strict=True, gt=0)]
+# min_precision_items must be a genuine JSON integer as well (True is not 1).
+PositiveStrictInt = Annotated[int, Field(strict=True, ge=1)]
 
 
 # ---- items ----------------------------------------------------------------
@@ -82,6 +85,51 @@ class SessionCreate(BaseModel):
             "值为正整数，所有配额之和不超过 max_items；不传则不设配额"
         ),
     )
+    target_se: float | None = Field(
+        None,
+        gt=0.0,
+        description=(
+            "可选能力估计目标标准误（正数）；设置后，已答数达到 "
+            "min_precision_items、当前标准误 1/√ΣI(θ) 不高于该值且标签配额"
+            "均已满足时提前结束会话（finish_reason=precision_reached）；"
+            "不传则维持答满/无题/到期的原有流程"
+        ),
+    )
+    min_precision_items: PositiveStrictInt | None = Field(
+        None,
+        description=(
+            "精度停测前的最少作答数（1~max_items）；设置 target_se 且不传"
+            "本字段时默认为 1；单独传本字段而不传 target_se 会被拒绝"
+        ),
+    )
+
+    @field_validator("target_se", mode="before")
+    @classmethod
+    def _reject_bool_target_se(cls, value: object) -> object:
+        # JSON true would otherwise coerce to 1.0; a flag is not a target SE.
+        if isinstance(value, bool):
+            raise ValueError("target_se 必须为正有限数，不能是布尔值")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_precision_config(self) -> "SessionCreate":
+        if self.target_se is not None:
+            if not math.isfinite(self.target_se) or self.target_se <= 0.0:
+                # ``gt=0`` alone accepts inf/nan on some float coercion paths.
+                raise ValueError("target_se 必须为正有限数")
+        if self.target_se is None and self.min_precision_items is not None:
+            raise ValueError(
+                "min_precision_items 只能与 target_se 一起设置"
+            )
+        if self.target_se is not None:
+            if self.min_precision_items is None:
+                self.min_precision_items = 1
+            elif self.min_precision_items > self.max_items:
+                raise ValueError(
+                    f"min_precision_items（{self.min_precision_items}）"
+                    f"不能超过 max_items（{self.max_items}）"
+                )
+        return self
 
 
 class SessionOut(BaseModel):
@@ -93,6 +141,15 @@ class SessionOut(BaseModel):
     duration_seconds: int | None = None
     expires_at: str | None = None
     tag_minimums: dict[str, int] = Field(default_factory=dict)
+    target_se: float | None = None
+    min_precision_items: int | None = None
+    standard_error: float | None = Field(
+        default=None,
+        description=(
+            "当前 θ 处本场全部已答题的 2PL Fisher 信息总和所对应的标准误 "
+            "1/√ΣI(θ)；尚无已答题（信息总和为 0）时为 null"
+        ),
+    )
     status: str
     finish_reason: str | None
     answered_count: int
@@ -109,6 +166,12 @@ class NextItemOut(BaseModel):
     exposure_limit: int
     answered_count: int
     max_items: int
+    target_se: float | None = None
+    min_precision_items: int | None = None
+    standard_error: float | None = Field(
+        default=None,
+        description="当前 θ 处的标准误 1/√ΣI(θ)；信息总和为 0 时为 null",
+    )
     finish_reason: str | None = None
     note: str | None = None
 
@@ -164,6 +227,15 @@ class ProgressOut(BaseModel):
     exposure_limit: int
     duration_seconds: int | None = None
     expires_at: str | None = None
+    target_se: float | None = None
+    min_precision_items: int | None = None
+    standard_error: float | None = Field(
+        default=None,
+        description=(
+            "当前 θ 处本场全部已答题的标准误 1/√ΣI(θ)；"
+            "信息总和为 0（尚无已答题）时为 null"
+        ),
+    )
     tag_minimums: dict[str, int] = Field(
         default_factory=dict, description="各内容标签的最低答题配额"
     )

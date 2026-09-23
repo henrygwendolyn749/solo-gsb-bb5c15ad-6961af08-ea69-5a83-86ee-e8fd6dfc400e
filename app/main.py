@@ -5,7 +5,8 @@ Flow
 1. ``POST /api/sessions``            create an examinee session
 2. ``POST /api/sessions/{id}/next``  get the most informative eligible item
 3. ``POST /api/sessions/{id}/responses``  submit an answer; theta is updated
-4. repeat 2-3 until the session finishes (max items or no eligible item)
+4. repeat 2-3 until the session finishes: max items, the optional precision
+   target (``target_se``), an exhausted item pool or the time deadline
 
 Mutating endpoints use ``BEGIN IMMEDIATE`` so concurrent requests on the same
 SQLite database are serialised; exposure counts and ability updates therefore
@@ -49,9 +50,10 @@ app = FastAPI(
     title="自适应测验选题 API",
     description=(
         "基于 2PL IRT 模型的计算机自适应测验（CAT）："
-        "单次 Newton 更新估计能力，信息量最大选题，全局曝光上限控制。"
+        "单次 Newton 更新估计能力，信息量最大选题，全局曝光上限控制；"
+        "可选按能力估计标准误 target_se 提前停测。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -180,6 +182,29 @@ def answered_count(conn: sqlite3.Connection, session_id: str) -> int:
     ).fetchone()[0]
 
 
+def session_standard_error(
+    conn: sqlite3.Connection, session_id: str, theta: float
+) -> float | None:
+    """Standard error of the current ability estimate.
+
+    Recomputes the 2PL Fisher information of *every* answered item of this
+    session at ``theta`` and returns ``1/sqrt(total)``.  Returns ``None``
+    when the information total is zero (e.g. nothing answered yet); a null
+    standard error can never trigger the precision stop.
+    """
+    total = 0.0
+    for row in conn.execute(
+        """
+        SELECT i.discrimination AS a, i.difficulty AS b
+        FROM responses r JOIN items i ON i.id = r.item_id
+        WHERE r.session_id = ?
+        """,
+        (session_id,),
+    ).fetchall():
+        total += irt.information(theta, row["a"], row["b"])
+    return irt.standard_error(total)
+
+
 def tag_minimums_for(conn: sqlite3.Connection, session_id: str) -> dict[str, int]:
     """Persisted content-tag quotas of a session (empty dict when none set)."""
     return {
@@ -222,7 +247,10 @@ def tag_shortfalls(
 
 
 def serialize_session(
-    row: sqlite3.Row, n_answered: int, tag_minimums: dict[str, int] | None = None
+    row: sqlite3.Row,
+    n_answered: int,
+    tag_minimums: dict[str, int] | None = None,
+    standard_error: float | None = None,
 ) -> SessionOut:
     return SessionOut(
         id=row["id"],
@@ -233,6 +261,9 @@ def serialize_session(
         duration_seconds=row["duration_seconds"],
         expires_at=row["expires_at"],
         tag_minimums=tag_minimums or {},
+        target_se=row["target_se"],
+        min_precision_items=row["min_precision_items"],
+        standard_error=standard_error,
         status=row["status"],
         finish_reason=row["finish_reason"],
         answered_count=n_answered,
@@ -371,8 +402,9 @@ def create_session(
             INSERT INTO sessions
                 (id, theta, current_item_id, max_items, exposure_limit,
                  duration_seconds, expires_at,
+                 target_se, min_precision_items,
                  status, finish_reason, created_at, updated_at)
-            VALUES (?, ?, NULL, ?, ?, ?, ?, 'active', NULL, ?, ?)
+            VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?)
             """,
             (
                 session_id,
@@ -381,6 +413,8 @@ def create_session(
                 body.exposure_limit or DEFAULT_EXPOSURE_LIMIT,
                 duration,
                 expires_at,
+                body.target_se,
+                body.min_precision_items,
                 now,
                 now,
             ),
@@ -400,8 +434,12 @@ def get_session(
     session_id: str, conn: sqlite3.Connection = Depends(get_db)
 ) -> SessionOut:
     row = get_session_or_404(conn, session_id)
+    se = session_standard_error(conn, session_id, row["theta"])
     return serialize_session(
-        row, answered_count(conn, session_id), tag_minimums_for(conn, session_id)
+        row,
+        answered_count(conn, session_id),
+        tag_minimums_for(conn, session_id),
+        se,
     )
 
 
@@ -435,6 +473,7 @@ def session_progress(
     # Report zero answered for every quota tag even if it has no response yet.
     tag_answered = {tag: answered_tags.get(tag, 0) for tag in minimums}
     tag_answered.update(answered_tags)
+    standard_error = session_standard_error(conn, session_id, session["theta"])
     return ProgressOut(
         session_id=session_id,
         status=session["status"],
@@ -446,6 +485,9 @@ def session_progress(
         exposure_limit=session["exposure_limit"],
         duration_seconds=session["duration_seconds"],
         expires_at=session["expires_at"],
+        target_se=session["target_se"],
+        min_precision_items=session["min_precision_items"],
+        standard_error=standard_error,
         tag_minimums=minimums,
         tag_answered=dict(sorted(tag_answered.items())),
         finish_reason=session["finish_reason"],
@@ -733,6 +775,17 @@ def next_item(
                     }
 
     item_row = outcome["item_row"]
+    # Re-read under no lock: selection already serialised state changes;
+    # this only surfaces the (possibly finished) precision configuration and
+    # the standard error recomputed at the current theta.
+    refreshed = conn.execute(
+        "SELECT * FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    standard_error = (
+        session_standard_error(conn, session_id, refreshed["theta"])
+        if refreshed is not None
+        else None
+    )
     return NextItemOut(
         session_id=session_id,
         status=outcome["status"],
@@ -742,6 +795,11 @@ def next_item(
         exposure_limit=outcome["exposure_limit"],
         answered_count=outcome["answered_count"],
         max_items=outcome["max_items"],
+        target_se=refreshed["target_se"] if refreshed is not None else None,
+        min_precision_items=(
+            refreshed["min_precision_items"] if refreshed is not None else None
+        ),
+        standard_error=standard_error,
         finish_reason=outcome["finish_reason"],
         note=outcome["note"],
     )
@@ -773,6 +831,14 @@ def submit_response(
     same write lock, so even a burst of concurrent retries observes the
     first committed record and is replayed (HTTP 200) instead of being
     scored a second time.
+
+    After theta has been advanced, a session carrying ``target_se`` ends in
+    the *same* transaction (``finish_reason = 'precision_reached'``) once at
+    least ``min_precision_items`` items are answered, the standard error
+    ``1/sqrt(sum I_i(theta))`` over all answered items is at or below the
+    target, and every tag quota is satisfied.  A zero information total
+    (null SE) can never trigger this; the max-items, deadline and exhausted
+    pool rules keep their original precedence.
     """
     response_key = body.response.strip().upper()
     stored_row: sqlite3.Row | None = None
@@ -881,7 +947,8 @@ def submit_response(
                 else:
                     raise HTTPException(status_code=409, detail="重复作答冲突")
             else:
-                # 5) Advance session state; finish eagerly at max_items.
+                # 5) Advance session state; finish eagerly at max_items, or
+                #    earlier when the optional precision target is reached.
                 conn.execute(
                     """UPDATE sessions
                        SET theta = ?, current_item_id = NULL, updated_at = ?
@@ -900,6 +967,31 @@ def submit_response(
                            WHERE id = ?""",
                         (now, session_id),
                     )
+                elif session["target_se"] is not None:
+                    # Optional precision stopping.  The summed 2PL Fisher
+                    # information of every answered item is recomputed at the
+                    # new theta inside this same transaction; a zero total
+                    # yields a null SE and can never trigger the stop.
+                    se = session_standard_error(conn, session_id, theta_after)
+                    min_items = session["min_precision_items"] or 1
+                    quotas_met = not tag_shortfalls(
+                        tag_minimums_for(conn, session_id),
+                        answered_by_tag(conn, session_id),
+                    )
+                    if (
+                        se is not None
+                        and total >= min_items
+                        and se <= session["target_se"]
+                        and quotas_met
+                    ):
+                        conn.execute(
+                            """UPDATE sessions
+                               SET status = 'finished',
+                                   finish_reason = 'precision_reached',
+                                   updated_at = ?
+                               WHERE id = ?""",
+                            (now, session_id),
+                        )
                 stored_row = conn.execute(
                     "SELECT * FROM responses WHERE id = ?", (body.response_id,)
                 ).fetchone()

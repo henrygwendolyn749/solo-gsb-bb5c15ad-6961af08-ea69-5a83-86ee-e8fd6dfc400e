@@ -54,6 +54,19 @@ def information(theta: float, a: float, b: float) -> float:
     return (a * a) * p * (1.0 - p)
 
 
+def standard_error(total_information: float) -> float | None:
+    """Standard error of the ability estimate, 1/sqrt(total information).
+
+    The total information is the sum of the 2PL Fisher information of every
+    answered item at the current theta.  A zero (or negative) total carries
+    no information about theta, so the standard error is undefined and
+    ``None`` is returned; callers must not treat it as precision reached.
+    """
+    if total_information <= 0.0:
+        return None
+    return 1.0 / math.sqrt(total_information)
+
+
 def newton_step(
     theta: float, a: float, b: float, score: int
 ) -> tuple[float, float, float, float]:
